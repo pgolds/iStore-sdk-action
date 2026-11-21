@@ -1,0 +1,183 @@
+name: Build iStoreOS SDK (Phicomm N1 & Raspberry Pi 4)
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      istoreos_branch:
+        description: 'iStoreOS 源码分支 (如 istoreos-25.12)'
+        required: true
+        type: string
+        default: 'istoreos-25.12'
+      device_preset:
+        description: '选择要编译 SDK 的设备架构'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - amlogic/meson (Phicomm N1)
+          - bcm27xx/bcm2711 (Raspberry Pi 4)
+          - custom
+      custom_target:
+        description: '自定义 Target/Subtarget (仅当上方选 custom 时生效，如 rockchip/armv8)'
+        required: false
+        type: string
+        default: ''
+      custom_profile:
+        description: '自定义 Device Profile (仅当上方选 custom 时生效，可留空)'
+        required: false
+        type: string
+        default: ''
+      upload_release:
+        description: '自动上传生成的 SDK 到 GitHub Release'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Generate build matrix
+        id: set-matrix
+        run: |
+          PRESET="${{ github.event.inputs.device_preset || 'all' }}"
+          CUSTOM_T="${{ github.event.inputs.custom_target }}"
+          CUSTOM_P="${{ github.event.inputs.custom_profile }}"
+
+          if [ "$PRESET" = "all" ]; then
+            MATRIX='{"include":[{"name":"Phicomm-N1","target":"amlogic/meson","profile":"phicomm_n1"},{"name":"RaspberryPi-4","target":"bcm27xx/bcm2711","profile":"rpi-4"}]}'
+          elif [[ "$PRESET" == amlogic/meson* ]]; then
+            MATRIX='{"include":[{"name":"Phicomm-N1","target":"amlogic/meson","profile":"phicomm_n1"}]}'
+          elif [[ "$PRESET" == bcm27xx/bcm2711* ]]; then
+            MATRIX='{"include":[{"name":"RaspberryPi-4","target":"bcm27xx/bcm2711","profile":"rpi-4"}]}'
+          else
+            if [ -z "$CUSTOM_T" ] || [[ "$CUSTOM_T" != */* ]]; then
+              echo "❌ 错误: 自定义 Target 格式必须为 <target>/<subtarget>"
+              exit 1
+            fi
+            SAFE_NAME="${CUSTOM_T//\//-}"
+            MATRIX="{\"include\":[{\"name\":\"${SAFE_NAME}\",\"target\":\"${CUSTOM_T}\",\"profile\":\"${CUSTOM_P}\"}]}"
+          fi
+
+          echo "matrix=${MATRIX}" >> $GITHUB_OUTPUT
+          echo "✅ 生成编译矩阵: ${MATRIX}"
+
+  build-sdk:
+    needs: prepare-matrix
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y $(curl -fsSL https://githubusercontent.com) zstd > /dev/null
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: Free up disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android || true
+          df -hT /workdir
+
+      - name: Clone iStoreOS source & update feeds
+        working-directory: /workdir
+        run: |
+          GH_HOST="https://github.com"
+          ISTORE_REPO="${GH_HOST}/istoreos/istoreos.git"
+          BRANCH="${{ github.event.inputs.istoreos_branch || 'istoreos-25.12' }}"
+
+          git clone --depth 1 -b "$BRANCH" "$ISTORE_REPO" openwrt
+          cd /workdir/openwrt
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure target & enable SDK generation
+        run: |
+          cd /workdir/openwrt
+          TARGET="${{ matrix.target }}"
+          TARGET_MAIN="${TARGET%/*}"
+          TARGET_SUB="${TARGET#*/}"
+          PROFILE="${{ matrix.profile }}"
+
+          cat <<EOF > .config
+          CONFIG_TARGET_${TARGET_MAIN}=y
+          CONFIG_TARGET_${TARGET_MAIN}_${TARGET_SUB}=y
+          CONFIG_SDK=y
+          EOF
+
+          if [ -n "$PROFILE" ]; then
+            echo "CONFIG_TARGET_${TARGET_MAIN}_${TARGET_SUB}_DEVICE_${PROFILE}=y" >> .config
+          fi
+
+          make defconfig
+
+          echo "=== 确认目标架构与 SDK 配置 ==="
+          grep -E "CONFIG_TARGET_${TARGET_MAIN}|CONFIG_SDK" .config || true
+
+      - name: Compile toolchain, kernel & SDK archive
+        run: |
+          cd /workdir/openwrt
+
+          echo "=== 1/4 编译宿主工具 (tools/install) ==="
+          make tools/install -j$(nproc)
+
+          echo "=== 2/4 编译交叉工具链 (toolchain/install) ==="
+          make toolchain/install -j$(nproc)
+
+          echo "=== 3/4 编译目标内核与符号表 (target/linux/compile) ==="
+          make target/linux/compile -j$(nproc)
+
+          echo "=== 4/4 打包生成 iStoreOS SDK (target/sdk/compile) ==="
+          make target/sdk/compile -j$(nproc)
+
+          mkdir -p /workdir/sdk_output
+          find bin/targets/ -type f \( -name "*sdk*.tar.zst" -o -name "*sdk*.tar.xz" \) -exec cp -v {} /workdir/sdk_output/ \;
+
+          echo "=== 检查生成的 SDK 文件 ==="
+          ls -lh /workdir/sdk_output/
+          sha256sum /workdir/sdk_output/* > /workdir/sdk_output/sha256sums.txt
+
+      - name: Verify SDK archive
+        id: check
+        run: |
+          SDK_FILE=$(find /workdir/sdk_output/ -maxdepth 1 -type f \( -name "*sdk*.tar.zst" -o -name "*sdk*.tar.xz" \) | head -n 1)
+          if [ -n "$SDK_FILE" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "sdk_name=$(basename "$SDK_FILE")" >> $GITHUB_OUTPUT
+          else
+            echo "❌ 未找到生成的 SDK 压缩包!"
+            exit 1
+          fi
+
+      - name: Upload SDK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: steps.check.outputs.status == 'success' && github.event.inputs.upload_release != false && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event.inputs.istoreos_branch || 'istoreos-25.12' }}-${{ matrix.name }}-sdk
+          name: iStoreOS SDK (${{ github.event.inputs.istoreos_branch || 'istoreos-25.12' }} - ${{ matrix.name }})
+          body: |
+            - **Device**: `${{ matrix.name }}`
+            - **iStoreOS Branch**: `${{ github.event.inputs.istoreos_branch || 'istoreos-25.12' }}`
+            - **Target**: `${{ matrix.target }}`
+            - **Profile**: `${{ matrix.profile || 'Generic' }}`
+            - **SDK Archive**: `${{ steps.check.outputs.sdk_name }}`
+          files: /workdir/sdk_output/*
