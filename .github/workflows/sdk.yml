@@ -1,0 +1,96 @@
+name: Build iStoreOS N1 SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: 'iStoreOS source repository (owner/repo)'
+        required: true
+        default: istoreos/istoreos
+        type: string
+      source_commit:
+        description: 'Exact full 40-character firmware source commit SHA'
+        required: true
+        type: string
+      build_config:
+        description: 'Firmware build config in the workflow repo (not /proc/config.gz)'
+        required: true
+        default: ci/n1/config.buildinfo
+        type: string
+      feeds_lock:
+        description: 'Pinned feeds file in the workflow repo'
+        required: true
+        default: ci/n1/feeds.buildinfo
+        type: string
+      expected_kernel_package:
+        description: 'Installed kernel package version (6.12.x~HASH-rN); blank for newly built firmware'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      BUILD_CONFIG: ${{ inputs.build_config }}
+      FEEDS_LOCK: ${{ inputs.feeds_lock }}
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      EXPECTED_KERNEL_PACKAGE: ${{ inputs.expected_kernel_package }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workflow-inputs
+          persist-credentials: false
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          [[ "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ -z "$EXPECTED_KERNEL_PACKAGE" ||
+             "$EXPECTED_KERNEL_PACKAGE" =~ ^[0-9]+\.[0-9]+\.[0-9]+~[0-9a-f]{32}-r[0-9]+$ ]]
+          for file in "$BUILD_CONFIG" "$FEEDS_LOCK"; do
+            resolved=$(realpath -e "workflow-inputs/$file")
+            [[ "$resolved" == "$GITHUB_WORKSPACE/workflow-inputs/"* && -s "$resolved" && -f "$resolved" ]]
+          done
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_commit }}
+          path: firmware
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install OpenWrt build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison clang flex g++-multilib \
+            gawk gcc-multilib gettext git libelf-dev libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync swig unzip zlib1g-dev zstd file \
+            wget ccache device-tree-compiler dosfstools jq cmake liblzma-dev
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Restore the firmware build inputs
+        working-directory: firmware
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          cp "../workflow-inputs/$FEEDS_LOCK" feeds.conf
+          # Accept only HTTPS Git feeds pinned to a full commit; reserve "base" for the SDK.
+          python3 - <<'PY'
+          import pathlib, re
+          pattern = re.compile(r"src-git(?:-full)?\s+([A-Za-z0-9_-]+)\s+(https://[A-Za-z0-9._~:/%+-]+)\^([0-9a-f]{40})")
+          feeds = {}
+          for raw in pathlib.Path("feeds.conf").read_text().splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              m = pattern.fullmatch(line)
+              if not m or m[1] == "base" or m[1] in feeds:
+                  raise SystemExit(f"Invalid, unpinned, or reserved feed: {line}")
+              feeds[m[1]] = m[3]
